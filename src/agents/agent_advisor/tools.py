@@ -1,91 +1,117 @@
+"""Outils métiers déterministes de l'agent d'orientation Advisor."""
 
-"""Outils déterministes de l'agent conseiller d'orientation."""
-
+import re
 from typing import Any
 
 from langchain_core.documents import Document
+from langchain_core.tools import tool
+
+
+@tool
+def calculer_total_ects(credits: list[int]) -> int:
+    """Additionner les crédits ECTS de plusieurs UE distinctes.
+
+    Args:
+        credits: Liste de crédits ECTS entiers, sans doublons d'UE.
+
+    Returns:
+        Nombre total de crédits ECTS.
+
+    Raises:
+        ValueError: Si un crédit est négatif.
+    """
+    if any(credit < 0 for credit in credits):
+        raise ValueError("Un crédit ECTS ne peut pas être négatif.")
+    return sum(credits)
+
+
+def _parse_ects(value: Any) -> int | None:
+    """Lire un nombre d'ECTS non négatif sans inventer de valeur."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 and value.is_integer() else None
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*(\d+)\s*(?:ECTS)?\s*", value, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def process_domain_logic(
     query: str,
     retrieved_docs: list[Document],
+    requested_codes: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Extraire les UE et calculer leurs ECTS sans doublons."""
+    """Dédoublonner les UE et calculer leurs ECTS à partir des métadonnées.
 
-    courses: dict[str, dict[str, Any]] = {}
+    Les ECTS ne sont jamais estimés depuis le texte généré par le LLM.
+    Un total incomplet n'est pas présenté comme le total demandé.
+    """
+    expected = list(dict.fromkeys(code.upper() for code in (requested_codes or [])))
+    seen: set[str] = set()
+    ues: list[dict[str, Any]] = []
 
     for doc in retrieved_docs:
-        metadata = doc.metadata
-
-        code = str(metadata.get("code_ue", "INCONNU"))
-        source = str(metadata.get("source", "inconnue"))
-        semestre = str(metadata.get("semestre", "INCONNU"))
-        filiere = str(metadata.get("filiere", "INCONNUE"))
-
-        # Plusieurs sections peuvent appartenir à la même UE.
-        # Le fichier source permet d'éviter de compter deux fois une UE.
-        if source in courses:
+        metadata = doc.metadata or {}
+        code = str(metadata.get("code_ue") or "").strip().upper()
+        source = str(metadata.get("source") or "").strip()
+        identity = code or source
+        if not identity or identity in seen:
             continue
+        seen.add(identity)
+        ues.append(
+            {
+                "code_ue": code,
+                "source": source,
+                "semestre": str(metadata.get("semestre") or ""),
+                "filiere": str(metadata.get("filiere") or ""),
+                "ects": _parse_ects(metadata.get("ects")),
+            }
+        )
 
-        raw_ects = metadata.get("ects", 0)
+    found_codes = {item["code_ue"] for item in ues}
+    missing_codes = [code for code in expected if code not in found_codes]
+    missing_ects = any(item["ects"] is None for item in ues)
+    complete = bool(ues) and not missing_codes and not missing_ects
+    total = (
+        calculer_total_ects.invoke(
+            {"credits": [item["ects"] for item in ues if item["ects"] is not None]}
+        )
+        if complete
+        else None
+    )
 
-        try:
-            ects = int(raw_ects)
-            ects = max(ects, 0)
-        except (ValueError, TypeError):
-            ects = 0
-
-        courses[source] = {
-            "code_ue": code,
-            "source": source,
-            "semestre": semestre,
-            "filiere": filiere,
-            "ects": ects,
-        }
-
-    ue_list = list(courses.values())
-    total_ects = sum(course["ects"] for course in ue_list)
+    if not ues:
+        summary = "Aucune UE documentée n'a été retrouvée."
+        status = "no_documents"
+    elif not complete:
+        summary = "Informations insuffisantes pour confirmer le total ECTS."
+        status = "incomplete"
+    else:
+        summary = f"{len(ues)} UE distincte(s), {total} ECTS au total."
+        status = "success"
 
     return {
-        "status": "success" if ue_list else "no_results",
+        "status": status,
         "question": query,
         "documents_analyzed": len(retrieved_docs),
-        "ue_retrouvees": ue_list,
-        "nombre_ue": len(ue_list),
-        "total_ects": total_ects,
-        "summary": (
-            f"{len(ue_list)} UE retrouvée(s), "
-            f"total de {total_ects} crédits ECTS."
-        ),
+        "ue_retrouvees": ues,
+        "nombre_ue": len(ues),
+        "codes_demandes": expected,
+        "codes_manquants": missing_codes,
+        "total_ects": total,
+        "ects_complets": complete,
+        "summary": summary,
     }
 
 
 def format_domain_response(tool_results: dict[str, Any]) -> str:
-    """Réponse de secours si le modèle Ollama est indisponible."""
-
-    courses = tool_results.get("ue_retrouvees", [])
-
-    if not courses:
-        return (
-            "Je n'ai trouvé aucune UE dans les documents consultés. "
-            "Je ne peux pas formuler de recommandation fiable."
-        )
-
-    lines = [
-        "Voici les UE retrouvées dans les syllabus :",
-    ]
-
-    for course in courses:
-        lines.append(
-            f"- {course['code_ue']} "
-            f"({course['semestre']}, {course['ects']} ECTS) "
-            f"— Source : {course['source']}"
-        )
-
-    lines.append(
-        f"Total des crédits des UE retrouvées : "
-        f"{tool_results['total_ects']} ECTS."
-    )
-
-    return "\n".join(lines)
-
+    """Réponse de secours lisible en cas d'échec ou d'absence du SLM."""
+    summary = str(tool_results.get("summary", "Information indisponible."))
+    missing = tool_results.get("codes_manquants", [])
+    if missing:
+        summary += " UE non retrouvées : " + ", ".join(missing) + "."
+    return summary
