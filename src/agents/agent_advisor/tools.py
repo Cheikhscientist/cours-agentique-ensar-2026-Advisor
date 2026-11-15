@@ -31,8 +31,7 @@ def process_domain_logic(
 
         try:
             ects = int(raw_ects)
-            if ects < 0:
-                ects = 0
+            ects = max(ects, 0)
         except (ValueError, TypeError):
             ects = 0
 
