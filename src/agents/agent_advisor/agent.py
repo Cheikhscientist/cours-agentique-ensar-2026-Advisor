@@ -50,10 +50,13 @@ def _extract_filters(question: str) -> dict[str, str]:
     result: dict[str, str] = {}
     semester = re.search(r"\bS(?:[1-9]|1[0-2])\b", question, re.IGNORECASE)
     if semester:
-        result["semestre"] = semester.group(0).upper()
+        result["semestre"] = f"S{semester.group(1)}"
+
     track = re.search(r"\bfili[eè]re\s*:\s*([A-Za-z0-9_-]+)", question, re.IGNORECASE)
+
     if track:
         result["filiere"] = track.group(1)
+
     return result
 
 
@@ -290,7 +293,7 @@ class CustomAgentPlugin(BaseAgentPlugin):
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
             model=os.getenv("OLLAMA_LLM_MODEL", "qwen2.5:3b"),
             temperature=0.0,
-            num_predict=400,
+            num_predict=550,
         )
         vector_store: Any = None
 
@@ -313,17 +316,18 @@ class CustomAgentPlugin(BaseAgentPlugin):
             explicit_codes = _extract_codes(question)
             filters = _extract_filters(question)
             semesters = _extract_semesters(question)
+
+            # Une question sur plusieurs semestres ne doit pas être
+            # Limitées au premier semestre détecté
+            if len (semesters)> 1 :
+                filters.pop("semestre", None)
+
+
             multi_semester_orientation = (
                 len(semesters) >= 2
                 and not explicit_codes
-                and bool(
-                    set(_normalized_words(question))
-                    & {
-                        "specialiser", "recommande", "recommandes", "selectionner",
-                        "choisir", "filieres", "filiere", "parcours", "orientation",
-                    }
-                )
             )
+
             docs: list[Document] = []
             retrieval_error = False
             try:
@@ -399,7 +403,15 @@ class CustomAgentPlugin(BaseAgentPlugin):
                     "6. Si une information est absente, indique-le clairement.\n"
                     "7. Donne les UE pertinentes avec leurs compétences exactes et sources.\n"
                     "8. Ne propose jamais une UE absente des documents fournis.\n"
-                    "9. Évite les répétitions et termine les comparaisons par une conclusion courte.\n\n"
+                    "9. Réponds directement, sans introduction ni répétition.\n"
+                    "10. Si l'étudiant compare plusieurs UE, commence par "
+                    "'Comparaison des filières et options :'.\n"
+                    "11. Pour chaque UE comparée, indique son code, sa filière, "
+                    "ses crédits ECTS vérifiés et deux compétences maximum.\n"
+                    "12. Termine par une conclusion courte adaptée à l'objectif "
+                    "professionnel de l'étudiant.\n"
+                    "13. Si une information est absente des documents, "
+                    "indique qu'elle n'est pas précisée.\n\n"
                     "EXEMPLE ONE-SHOT FICTIF (pas un vrai syllabus) :\n"
                     "Question : Je veux travailler en analyse de données.\n"
                     "Documents : EX_101 = analyse SQL ; EX_102 = gestion d'incidents cyber.\n"
